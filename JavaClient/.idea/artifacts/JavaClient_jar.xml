@@ -1,0 +1,9 @@
+<component name="ArtifactManager">
+  <artifact type="jar" name="JavaClient:jar">
+    <output-path>$PROJECT_DIR$/out/artifacts/JavaClient_jar</output-path>
+    <root id="archive" name="JavaClient.jar">
+      <element id="module-output" name="JavaClient" />
+      <element id="extracted-dir" path="$MAVEN_REPOSITORY$/com/beust/jcommander/1.48/jcommander-1.48.jar" path-in-jar="/" />
+    </root>
+  </artifact>
+</component>
