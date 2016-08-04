@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project basedir="." default="kpnfc" name="Keepass NFC JavaCard applet">
+  <!-- Applet building dependencies -->
+  <property name="JC222" value="ext/java_card_kit-2_2_2"/>
+  
+  <!-- ant-javacard task from javacard.pro -->
+  <taskdef name="javacard" classname="pro.javacard.ant.JavaCard" classpath="ext/ant-javacard.jar"/>
+  <!-- All included applets -->
+  <target name="kpnfc">
+    <javacard jckit="${JC222}">
+	  <cap output="kpnfc.cap" sources="src" aid="f037547280">
+        <applet class="net.lardcave.keepassnfcapplet.KeepassNFC" aid="f0375472804fd5fa0f243e42c1b63825"/>
+      </cap>
+    </javacard>
+  </target>
+</project>
