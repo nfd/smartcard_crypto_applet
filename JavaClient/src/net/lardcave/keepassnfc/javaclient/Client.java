@@ -10,23 +10,24 @@ import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import javax.smartcardio.*;
-import java.security.InvalidAlgorithmParameterException;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
+import java.math.BigInteger;
+import java.security.*;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.RSAPublicKeySpec;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 public class Client {
-    @Parameter(names="-card-key", description="Use card key (hex, 16 bytes / 32 hex chars)")
-    public String cardKeyString;
+    @Parameter(names="-chat", description="Show APDU (smartcard) communication")
+    public boolean showChat;
 
     @Parameter(names="-password-key", description="Password key (hex)")
     public String passwordKeyString;
 
-    @Parameter(names="-default-keys", description="Use test values for password and card keys")
-    public boolean useDefaultKeys;
+    @Parameter(names="-default-key", description="Use test values for password key")
+    public boolean useDefaultKey;
 
     @Parameter(names="-data", description="Data (hex string)")
     public String testDataString;
@@ -34,13 +35,11 @@ public class Client {
     @Parameter(description="Command {set_card_key, set_password_key, encrypt, decrypt}")
     public List<String> command = new ArrayList<>();
 
-    private static final byte[] TEST_CARD_KEY = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     private static final byte[] TEST_PASSWORD_KEY = {15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
     private static final byte[] TEST_INPUT = {(byte) 0x70, (byte) 0x65, (byte) 0x72, (byte) 0x73, (byte) 0x69,
             (byte) 0x6d, (byte) 0x6d, (byte) 0x6f, (byte) 0x6e, (byte) 0x73, (byte) 0x20, (byte) 0x2d, (byte) 0x20,
             (byte) 0x79, (byte) 0x75, (byte) 0x6d};
 
-    private byte[] cardKey;
     private byte[] passwordKey;
     private byte[] passwordKeyIv;
     private byte[] testData;
@@ -48,11 +47,13 @@ public class Client {
 
     private final static byte CLA_CARD_KPNFC_CMD           = (byte)0xB0;
 
-    private final static byte INS_CARD_SET_CARD_KEY        = (byte)0x70;
+    private final static byte INS_CARD_GET_CARD_PUBKEY     = (byte)0x70;
     private final static byte INS_CARD_SET_PASSWORD_KEY    = (byte)0x71;
     private final static byte INS_CARD_PREPARE_DECRYPTION  = (byte)0x72;
     private final static byte INS_CARD_DECRYPT_BLOCK       = (byte)0x73;
     private final static byte INS_CARD_GET_VERSION         = (byte)0x74;
+    private final static byte INS_CARD_GENERATE_CARD_KEY   = (byte)0x75;
+    private final static byte INS_CARD_WRITE_TO_SCRATCH    = (byte)0x76;
 
     private final static byte RESPONSE_SUCCEEDED           = (byte)0x1;
     private final static byte RESPONSE_FAILED              = (byte)0x2;
@@ -86,27 +87,18 @@ public class Client {
     }
 
     public void run() throws CardException {
-        if(command.size() != 1) {
+        if(command.size() == 0) {
             System.err.println("Specify a command.");
             return;
         }
 
         random = new SecureRandom();
 
-        cardKey = new byte[16];
         passwordKey = new byte[16];
 
-        if(useDefaultKeys) {
-            System.arraycopy(TEST_CARD_KEY, 0, cardKey, 0, cardKey.length);
+        if(useDefaultKey) {
             System.arraycopy(TEST_PASSWORD_KEY, 0, passwordKey, 0, passwordKey.length);
         } else {
-            if(cardKeyString != null) {
-                cardKey = decodeHexString(cardKeyString);
-            } else {
-                cardKey = randomBytes(16);
-                //System.out.println("Chose random card key: " + toHex(cardKey));
-            }
-
             if(passwordKeyString != null) {
                 passwordKey = decodeHexString(passwordKeyString);
             } else {
@@ -123,8 +115,8 @@ public class Client {
         //System.out.println("You specified data: " + toHex(testData));
 
         switch (command.get(0)) {
-            case "set_card_key":
-                setCardKey();
+            case "generate_card_key":
+                generateCardKey();
                 break;
             case "set_password_key":
                 setPasswordKey();
@@ -144,22 +136,126 @@ public class Client {
         }
     }
 
-    public void setCardKey() throws CardException {
-        byte[] command = constructApdu(INS_CARD_SET_CARD_KEY, cardKey);
+    public void generateCardKey() throws CardException {
+        byte[] command = constructApdu(INS_CARD_GENERATE_CARD_KEY);
 
         sendSingleCommand(command);
-        System.out.println("Card key set to " + toHex(cardKey));
+    }
+
+    protected short getShort(byte[] buffer, int idx) {
+        // assumes big-endian which seems to be how JavaCard rolls
+        return (short)( (((buffer[idx] & 0xff) << 8) | (buffer[idx + 1] & 0xff) ));
+    }
+
+    protected void putShort(byte[] args, int idx, short val) {
+        args[idx] = (byte)((val & 0xff) >> 8);
+        args[idx + 1] = (byte)(val & 0xff);
+    }
+
+    public RSAPublicKey getCardPubKey(CardChannel channel) throws CardException {
+        byte[] args = new byte[3];
+
+        args[0] = 1; // get exponent
+        args[1] = 0;
+        args[2] = 0;
+        byte[] command = constructApdu(INS_CARD_GET_CARD_PUBKEY, args);
+        byte[] result = sendAPDU(channel, command).getBytes();
+
+        if(result == null || result[0] != 1) {
+            System.err.println("Couldn't retrieve exponent");
+            return null;
+        }
+
+        BigInteger exponent = new BigInteger(1, Arrays.copyOfRange(result, 3, result[2] + 3));
+
+        List<byte[]> modulusPortions = new ArrayList<>();
+        args[0] = 2; // get modulus, initial
+        short offset = 0, bytesToGo = 0;
+        do {
+            command = constructApdu(INS_CARD_GET_CARD_PUBKEY, args);
+            result = sendAPDU(channel, command).getBytes();
+
+            if (result == null || result[0] != 1) {
+                System.err.println("Couldn't retrieve modulus");
+                return null;
+            }
+            int bytesSent = getShort(result, 1);
+            bytesToGo = getShort(result, 3);
+
+            modulusPortions.add(Arrays.copyOfRange(result, 5, result.length - 2)); // exclude result code
+            offset += bytesSent;
+
+            args[0] = 3; // get modulus, continued
+            putShort(args, 1, offset);
+        } while(bytesToGo > 0);
+
+        byte[] modulusBytes = new byte[offset];
+        offset = 0;
+        for(byte[] portion: modulusPortions) {
+            System.arraycopy(portion, 0, modulusBytes, offset, portion.length);
+            offset += portion.length;
+        }
+
+        BigInteger modulus = new BigInteger(1, modulusBytes);
+
+        /*
+        System.out.println("Exponent: " + exponent);
+        System.out.println("Modulus:  " + toHex(modulus.toByteArray()));
+        System.out.println("Modulus bytes: " + modulus.toByteArray().length);
+        */
+
+        KeyFactory keyFactory;
+        try {
+            keyFactory = KeyFactory.getInstance("RSA");
+        } catch (NoSuchAlgorithmException e) {
+            e.printStackTrace();
+            return null;
+        }
+
+        RSAPublicKey publicKey;
+        try {
+            publicKey = (RSAPublicKey) keyFactory.generatePublic(new RSAPublicKeySpec(modulus, exponent));
+        } catch (InvalidKeySpecException e) {
+            e.printStackTrace();
+            return null;
+        }
+
+        return publicKey;
+    }
+
+    public static final int MAX_CHUNK_SIZE = 120;
+
+    public void writeToScratchArea(CardChannel channel, byte[] data) throws CardException {
+        for(int offset = 0; offset < data.length; offset += MAX_CHUNK_SIZE) {
+            int amount = data.length - offset;
+            if(amount > MAX_CHUNK_SIZE)
+                amount = MAX_CHUNK_SIZE;
+
+            byte[] args = new byte[amount + 2];
+            putShort(args, 0, (short)offset);
+
+            System.arraycopy(data, offset, args, 2, amount);
+
+            byte[] command = constructApdu(INS_CARD_WRITE_TO_SCRATCH, args);
+            sendAPDU(channel, command);
+        }
     }
 
     public void setPasswordKey() throws CardException {
-        byte[] encryptedPasswordKey = encryptWithCardKey(passwordKey);
-
-        if(encryptedPasswordKey != null) {
-            byte[] command = constructApdu(INS_CARD_SET_PASSWORD_KEY, encryptedPasswordKey);
-
-            sendSingleCommand(command);
-            System.out.println("Password key set to " + toHex(passwordKey));
+        CardChannel channel = getCardChannel();
+        if(channel == null) {
+            return;
         }
+        byte[] encryptedPasswordKey = encryptWithCardKey(channel, passwordKey);
+        if(encryptedPasswordKey == null) {
+            return;
+        }
+
+        writeToScratchArea(channel, encryptedPasswordKey);
+
+        byte[] command = constructApdu(INS_CARD_SET_PASSWORD_KEY);
+        sendAPDU(channel, command);
+        System.out.println("Password key set to " + toHex(passwordKey));
     }
 
     private byte[] sendSingleCommand(byte[] command) throws CardException {
@@ -172,25 +268,31 @@ public class Client {
         }
     }
 
-    private byte[] encryptWithCardKey(byte[] input) {
+    private byte[] encryptWithCardKey(CardChannel channel, byte[] input) throws CardException {
+        RSAPublicKey publicKey = getCardPubKey(channel);
         Cipher cipher;
 
         try {
-            cipher = Cipher.getInstance("AES/ECB/NoPadding");
+            cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
         } catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
             e.printStackTrace();
             return null;
         }
 
-        SecretKeySpec key = new SecretKeySpec(cardKey, "AES");
         try {
-            cipher.init(Cipher.ENCRYPT_MODE, key);
+            cipher.init(Cipher.ENCRYPT_MODE, publicKey);
         } catch (InvalidKeyException e) {
             e.printStackTrace();
             return null;
         }
 
+        /*
+        System.out.println("Public key exponent: " + publicKey.getPublicExponent());
+        System.out.println("Public key modulus : " + publicKey.getModulus());
+        */
+
         try {
+            //System.out.println("Encrypting " + toHex(input) + " size " + input.length);
             return cipher.doFinal(input);
         } catch (IllegalBlockSizeException | BadPaddingException e) {
             e.printStackTrace();
@@ -242,32 +344,29 @@ public class Client {
         byte[] transactionKey = randomBytes(16);
         byte[] transactionIv = randomBytes(16);
 
-        byte[] encryptedTransactionKey = encryptWithCardKey(transactionKey);
-        if(encryptedTransactionKey == null) {
-            return;
-        }
-
         // Connect to the card and establish a transaction key.
         byte[] apdu;
-        byte[] transactionParameters = new byte[48];
+        byte[] transactionParameters = new byte[32];
 
         // Prepare decryption: 16 bytes of transaction key, encrypted with the card key,
         // followed by two IVs.
-        System.arraycopy(encryptedTransactionKey, 0, transactionParameters, 0, 16);
-        System.arraycopy(transactionIv, 0, transactionParameters, 16, 16);
-        System.arraycopy(passwordKeyIv, 0, transactionParameters, 32, 16);
-
-        apdu = constructApdu(INS_CARD_PREPARE_DECRYPTION, transactionParameters);
         CardChannel channel = getCardChannel();
 
         if(channel != null) {
+            byte[] encryptedTransactionKey = encryptWithCardKey(channel, transactionKey);
+            if(encryptedTransactionKey == null) {
+                return;
+            }
+            writeToScratchArea(channel, encryptedTransactionKey);
+            System.arraycopy(transactionIv, 0, transactionParameters, 0, 16);
+            System.arraycopy(passwordKeyIv, 0, transactionParameters, 16, 16);
+
+            apdu = constructApdu(INS_CARD_PREPARE_DECRYPTION, transactionParameters);
             ResponseAPDU response = sendAPDU(channel, apdu);
-            System.out.println(toHex(response.getBytes()));
 
             // Decryption has been prepared, so decrypt the text.
             apdu = constructApdu(INS_CARD_DECRYPT_BLOCK, testData);
             response = sendAPDU(channel, apdu);
-            System.out.println(toHex(response.getBytes()));
 
             // This is encrypted with the transaction key, so decrypt it.
             byte[] decrypted = decryptWithTransactionKey(response.getBytes(), 1, 16, transactionKey, transactionIv);
@@ -319,6 +418,10 @@ public class Client {
         return result;
     }
 
+    public static byte[] constructApdu(byte command) {
+        byte[] nothing = {};
+        return constructApdu(command, nothing);
+    }
 
     public static byte[] constructApdu(byte command, byte[] data)
     {
@@ -346,14 +449,22 @@ public class Client {
             return null;
         }
 
+
         Card card = terminal.connect("*");
         CardChannel channel = card.getBasicChannel();
+
+        // Terminal-specific: ACR122U pseudo-APDU to set card timeout.
+        // timeout parameter is in units of 5 seconds, or 00 for no timeout, or ff for "wait until contactless chip responds"
+        ResponseAPDU response;
+        byte timeout = (byte)(1200 / 5);
+        byte[] acr_timeout_apdu = {(byte)0xff, (byte)0x00, (byte)0x41, timeout, (byte)0};
+        sendAPDU(channel, acr_timeout_apdu);
 
         // reset card (?!)
         ATR atr = card.getATR();
 
         // Select applet
-        ResponseAPDU response = sendAPDU(channel, selectAppletAPDU);
+        response = sendAPDU(channel, selectAppletAPDU);
         byte[] responseBytes = response.getBytes();
 
         if(responseBytes[0] != (byte)0x90 && responseBytes[1] != (byte)0x00) {
@@ -378,12 +489,16 @@ public class Client {
         }
     }
 
-    private static ResponseAPDU sendAPDU(CardChannel channel, byte[] apdu) throws CardException {
-        System.out.println("OUT: " + toHex(apdu));
+    private ResponseAPDU sendAPDU(CardChannel channel, byte[] apdu) throws CardException {
+        if(showChat)
+            System.out.println("OUT: " + toHex(apdu));
+
         CommandAPDU command = new CommandAPDU(apdu);
 
         ResponseAPDU response = channel.transmit(command);
-        System.out.println("IN:  " + toHex(response.getBytes()));
+
+        if(showChat)
+            System.out.println("IN:  " + toHex(response.getBytes()));
         return response;
     }
 
