@@ -169,9 +169,10 @@ public class Client {
         BigInteger exponent = new BigInteger(1, Arrays.copyOfRange(result, 3, result[2] + 3));
 
         List<byte[]> modulusPortions = new ArrayList<>();
-        args[0] = 2; // get modulus, initial
+        args[0] = 2; // get modulus
         short offset = 0, bytesToGo = 0;
         do {
+            putShort(args, 1, offset);
             command = constructApdu(INS_CARD_GET_CARD_PUBKEY, args);
             result = sendAPDU(channel, command).getBytes();
 
@@ -184,9 +185,6 @@ public class Client {
 
             modulusPortions.add(Arrays.copyOfRange(result, 5, result.length - 2)); // exclude result code
             offset += bytesSent;
-
-            args[0] = 3; // get modulus, continued
-            putShort(args, 1, offset);
         } while(bytesToGo > 0);
 
         byte[] modulusBytes = new byte[offset];
@@ -198,17 +196,13 @@ public class Client {
 
         BigInteger modulus = new BigInteger(1, modulusBytes);
 
-        /*
-        System.out.println("Exponent: " + exponent);
-        System.out.println("Modulus:  " + toHex(modulus.toByteArray()));
-        System.out.println("Modulus bytes: " + modulus.toByteArray().length);
-        */
+        // Turn these numbers into a crypto-api-friendly PublicKey object.
 
         KeyFactory keyFactory;
         try {
             keyFactory = KeyFactory.getInstance("RSA");
         } catch (NoSuchAlgorithmException e) {
-            e.printStackTrace();
+            System.err.println("Couldn't create RSA keyfactory"); // which would be very strange
             return null;
         }
 
@@ -216,7 +210,7 @@ public class Client {
         try {
             publicKey = (RSAPublicKey) keyFactory.generatePublic(new RSAPublicKeySpec(modulus, exponent));
         } catch (InvalidKeySpecException e) {
-            e.printStackTrace();
+            System.err.println("Couldn't produce a PublicKey object");
             return null;
         }
 
@@ -270,38 +264,38 @@ public class Client {
 
     private byte[] encryptWithCardKey(CardChannel channel, byte[] input) throws CardException {
         RSAPublicKey publicKey = getCardPubKey(channel);
+        if(publicKey == null) {
+            System.err.println("Key invalid, can't encrypt with card key");
+            return null;
+        }
+
         Cipher cipher;
 
         try {
             cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
         } catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
-            e.printStackTrace();
+            System.err.println("RSA cipher not supported");
             return null;
         }
 
         try {
             cipher.init(Cipher.ENCRYPT_MODE, publicKey);
         } catch (InvalidKeyException e) {
-            e.printStackTrace();
+            System.err.println("Invalid key");
             return null;
         }
 
-        /*
-        System.out.println("Public key exponent: " + publicKey.getPublicExponent());
-        System.out.println("Public key modulus : " + publicKey.getModulus());
-        */
-
         try {
-            //System.out.println("Encrypting " + toHex(input) + " size " + input.length);
             return cipher.doFinal(input);
         } catch (IllegalBlockSizeException | BadPaddingException e) {
+            System.err.println("Couldn't encrypt with card key:");
             e.printStackTrace();
             return null;
         }
     }
 
     public void encrypt() {
-        /* Doesn't use the card -- simply encrypts test data with the password key for testing. */
+        /* Encrypts test data with the password key for testing. */
         Cipher cipher;
 
         try {
@@ -357,21 +351,27 @@ public class Client {
             if(encryptedTransactionKey == null) {
                 return;
             }
+            // The encrypted transaction key is too large (256 bytes for a 2048-bit RSA key) to fit
+            // in one APDU, so write it to the card's scratch area in pieces.
             writeToScratchArea(channel, encryptedTransactionKey);
+
+            // Now that the encrypted key is in the scratch area, tell the card to decrypt the
+            // transaction key and prepare for decryption using the password key.
             System.arraycopy(transactionIv, 0, transactionParameters, 0, 16);
             System.arraycopy(passwordKeyIv, 0, transactionParameters, 16, 16);
+            sendAPDU(channel, constructApdu(INS_CARD_PREPARE_DECRYPTION, transactionParameters));
 
-            apdu = constructApdu(INS_CARD_PREPARE_DECRYPTION, transactionParameters);
-            ResponseAPDU response = sendAPDU(channel, apdu);
-
-            // Decryption has been prepared, so decrypt the text.
+            // Decryption has been initialised, so ask the card to decrypt the text.
             apdu = constructApdu(INS_CARD_DECRYPT_BLOCK, testData);
-            response = sendAPDU(channel, apdu);
+            ResponseAPDU response = sendAPDU(channel, apdu);
 
             // This is encrypted with the transaction key, so decrypt it.
             byte[] decrypted = decryptWithTransactionKey(response.getBytes(), 1, 16, transactionKey, transactionIv);
             if(decrypted != null) {
-                System.out.println(toHex(decrypted));
+                for(byte b: decrypted) {
+                    System.out.print((char)b);
+                }
+                System.out.println();
             }
         }
     }
