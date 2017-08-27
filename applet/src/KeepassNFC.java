@@ -54,6 +54,9 @@ public class KeepassNFC extends Applet {
 		aes_key_temporary = JCSystem.makeTransientByteArray((short)260, JCSystem.CLEAR_ON_DESELECT);
 		card_cipher_initialised = false;
 
+		/* Generate RSA keypair on install, as if generateCardKey was called. */
+		card_key.genKeyPair();
+
 		register();
 	}
 
